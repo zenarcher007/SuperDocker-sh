@@ -40,6 +40,7 @@ function docker() {
   
   SOCAT_PATH="/opt/homebrew/bin/socat"
   GREP_PATH="/opt/homebrew/bin/ggrep"
+  NETCAT_PATH="/usr/bin/nc"
   #_.-^-._.-^-._.-^-._.-^-._
 
   SOCKET_DIR="/tmp/.docker"
@@ -65,9 +66,6 @@ function docker() {
         fi
       fi
 
-      # Create control master connection, which will be used throughout this context
-      ssh -N -f -oControlMaster=auto -oControlPath="$SOCKET_DIR/$reqHost_CONTROL_MASTER.sock" -oControlPersist=2m "$reqHost"
-
       ### This works by creating a remote Docker socket, and telling Docker to point to it. ###
       # If the Docker socket does not exist, is accessible, and a process is listening
       # socat will exit uncleanly if any one of these are false.
@@ -88,33 +86,51 @@ function docker() {
   # Note: "-p" is contained in "--publish"
   # Case #1: forward ports and then run command. Case #2: just run the command
   if [[ "$@" == *"-p"* || "$@" == *"--publish"* ]] && [[ "$@" != *"-d"* && "$@" != *"--detach"* ]]; then
+    reqHost="$(docker context show)"
+    echo "$reqHost"
+    # Create control master connection
+    ssh -N -f -oControlMaster=auto -oControlPath="$SOCKET_DIR/${reqHost}_CONTROL_MASTER.sock" -oControlPersist=2m "$reqHost"
 
     # Extract the last number from all port command line specifications (the remote device port that will be brought locally)
     ports="$("$GREP_PATH" -P -o '(-p|--publish) ([0-9]*:)?[0-9]*' <<< "$@" | "$GREP_PATH" -P -o '(?<=:)?[0-9]*$')"
     echo $ports
     echo -n "Forwarded ports" 1>&2
-    forwarded_ports=""
+    forwarded_ports_local=""
+    forwarded_ports_remote=""
     for port in $ports; do
-      if ! nc -z "127.0.0.1" "$port" &>/dev/null; then # Note: netcat is required for this
-        if [[ -z "$forwarded_ports" ]]; then forwarded_ports="$port"
-        else
-          forwarded_ports+=" $port"
-        fi
-        ssh -oControlPath="$SOCKET_DIR/$reqHost_CONTROL_MASTER.sock" -O forward -L "127.0.0.1:$port:localhost:$port" "$reqHost"
-        echo -n " $port" 1>&2
-      else
-        echo -n " [$port is already bound]"
+      # If the port is not already bound, forward it as a "local" port. Otherwise, forward it as a "remote" port
+      # In simplified terms,
+      # local - making a connection to a (newly) listening port on your local machine will make a query to the remote program
+      # remote - a query made by the remote program will make a query to an (already) listening program's port on your local machine
+      
+      show_remote_warning="false"
+      if ! "$NETCAT_PATH" -z "127.0.0.1" "$port" &>/dev/null; then
+        ssh -oControlPath="$SOCKET_DIR/${reqHost}_CONTROL_MASTER.sock" -O forward -L "127.0.0.1:$port:localhost:$port" "$reqHost"
+        # Add port to list of successfully forwarded ports
+        [[ -z "$forwarded_ports_local" ]] && forwarded_ports_local="$port" || forwarded_ports_local+=" $port"
+        echo -n ", $port (LOCAL)" 1>&2
+      else # If the port is already bound on your local machine, assume you want to recieve connections from the remote program instead
+        # old behavior: echo -n " [$port is already bound]"
+        ssh -oControlPath="$SOCKET_DIR/${reqHost}_CONTROL_MASTER.sock" -O forward -R "127.0.0.1:$port:localhost:$port" "$reqHost"
+        [[ -z "$forwarded_ports_remote" ]] && forwarded_ports_remote="$port" || forwarded_ports_remote+=" $port"
+        echo -n ", $port (REMOTE)" 1>&2
+        show_remote_warning="true"
       fi
     done
-    echo 1>&2
+    echo 1>&2 # Newline
+    [[ "$show_remote_warning" == "true" ]] && echo "  (Note: ports forwarded as REMOTE were already in use locally)" 1>&2
 
     "$cmd" "$@" # Run command
     e="$?"
-    
+
     echo -en "\nUnforwarded ports" 1>&2
-    for port in $forwarded_ports; do
-      ssh -oControlPath="$SOCKET_DIR/$reqHost_CONTROL_MASTER.sock" -O cancel -L "127.0.0.1:$port:localhost:$port" "$reqHost"
-      echo -n " $port" 1>&2
+    for port in $forwarded_ports_local; do
+      ssh -oControlPath="$SOCKET_DIR/${reqHost}_CONTROL_MASTER.sock" -O cancel -L "127.0.0.1:$port:localhost:$port" "$reqHost"
+      echo -n ", $port (LOCAL)" 1>&2
+    done
+    for port in $forwarded_ports_remote; do
+      ssh -oControlPath="$SOCKET_DIR/${reqHost}_CONTROL_MASTER.sock" -O cancel -R "127.0.0.1:$port:localhost:$port" "$reqHost"
+      echo -n ", $port (REMOTE)" 1>&2
     done
     echo 1>&2
   else
@@ -123,7 +139,16 @@ function docker() {
   fi
 
   unset reqHost
-  #unset DOCKER_HOST
   unset cmd
+  unset show_remote_warning
+  unset forwarded_ports_local
+  unset forwarded_ports_remote
+  unset ports
+  unset DOCKER_PATH
+  unset DOCKER_BUILDX_PATH
+  unset SOCAT_PATH
+  unset GREP_PATH
+  unset NETCAT_PATH
+  unset SOCKET_DIR
   return "$e"
 }
